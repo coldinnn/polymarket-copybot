@@ -33,9 +33,21 @@ RESCORE_INTERVAL  = 86400   # re-score existing traders every 24 hours
 TOP_N             = 50      # analyze top 50 leaderboard traders
 REGISTRY_PATH     = Path(os.getenv("REGISTRY_PATH", "/tmp/trader_registry.json"))
 
-# Seed wallets — always tracked regardless of leaderboard position
+# Seed wallets — top leaderboard traders, always analyzed on startup.
+# Analyzer auto-detects sport focus and qualifies/rejects by win rate.
 SEED_WALLETS = {
-    "0xf8831548531d56ad6a4331493243c447a827cd1f": "Inaccuratestake",
+    "0xf8831548531d56ad6a4331493243c447a827cd1f": "Inaccuratestake",       # #2 tennis
+    "0x99aea8f9a64d0142b6b66a4b9d02a2211d45386f": "LEEEROYJENKINS",         # #1 overall
+    "0x26437896ed9dfeb2f69765edcafe8fdceaab39ae": "Latina",                 # #3 overall
+    "0xb91aeb5accc33a5f9a8615b8ed6b2d352e913987": "afghj2421",              # #4 overall
+    "0x0346afae2603313d2bbee96b628536c8cbe352a5": "GoalLineGhost",           # #6 sports
+    "0x4761ecf3578e388a9b16c43f874efe32ee855ae8": "Grenderen",              # #10 overall
+    "0x84cfffc3f16dcc353094de30d4a45226eccd2f63": "mooseborzoi",            # #11 overall
+    "0xfe787d2da716d60e8acff57fb87eb13cd4d10319": "ferrariChampions2026",   # #13 sports
+    "0xad9c94a65d1f053b8bb31815865a0d4c64b69889": "jalenbrunson-official",  # #14 sports
+    "0x5268527977f700f9bf9b6d5cd843859e4e70135d": "HomeRunHazard",          # #18 sports
+    "0xbee54d90051720e27921dc6874f02d646ffca636": "downtownfee",            # #8 overall
+    "0xf0318c32136c2db7fec88b84869aee6a1106c80c": "BreakTheBank",           # #17 overall
 }
 
 
@@ -70,18 +82,43 @@ class LeaderboardScanner:
 
     async def start(self):
         self._running = True
-        # Seed wallets first
+        # Analyze all seed wallets on startup
         await self._seed()
-        # Then periodic scan
+        # Periodic re-score loop (no leaderboard API available publicly)
         while self._running:
+            await asyncio.sleep(RESCORE_INTERVAL)
             try:
-                await self._scan()
+                await self._rescore_all()
             except Exception as e:
-                logger.error(f"Leaderboard scan error: {e}")
-            await asyncio.sleep(SCAN_INTERVAL)
+                logger.error(f"Rescore error: {e}")
 
     def stop(self):
         self._running = False
+
+    # ── Re-score all ─────────────────────────────────────────────────────────
+
+    async def _rescore_all(self):
+        """Re-analyze every tracked wallet every 24h to catch degradation."""
+        self._log(f"Re-scoring {len(self._registry)} tracked wallets…")
+        for address in list(self._registry.keys()):
+            existing = self._registry[address]
+            try:
+                await asyncio.sleep(0.5)
+                profile = await self._analyzer.analyze(address, existing.username)
+                if existing.status == "approved" and profile.win_rate < existing.win_rate - 0.10:
+                    profile.status = "paused"
+                    profile.reject_reason = (
+                        f"win rate dropped {existing.win_rate:.1%} → {profile.win_rate:.1%}"
+                    )
+                    self._log(f"⚠ PAUSED {existing.username}: {profile.reject_reason}")
+                elif existing.status == "paused" and profile.win_rate >= 0.60:
+                    profile.status = "approved"
+                    self._log(f"↑ REINSTATED {existing.username}: {profile.win_rate:.1%} WR")
+                self._registry[address] = profile
+            except Exception as e:
+                logger.error(f"Rescore failed for {existing.username}: {e}")
+        self._save_registry()
+        self._log(f"Rescore done. {len(self.approved_wallets)} approved.")
 
     # ── Seeding ───────────────────────────────────────────────────────────────
 
