@@ -1,6 +1,12 @@
 """
-Polls the target wallet's Polymarket activity every 3 seconds.
-Emits a CopySignal the first time a new outcome token is bought.
+Monitors multiple approved Polymarket wallets for new BUY positions.
+
+The approved wallet list is driven by LeaderboardScanner — updated live
+as new traders are approved or paused. Each wallet gets its own async
+polling loop at POLL_INTERVAL seconds.
+
+A CopySignal fires the first time a new tokenId is seen across ALL wallets
+(we don't copy the same token twice even if two traders both buy it).
 """
 import asyncio
 import logging
@@ -12,29 +18,34 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-TARGET_WALLET = "0xf8831548531d56ad6a4331493243c447a827cd1f"
-POLL_INTERVAL = 3   # seconds between polls
 DATA_API      = "https://data-api.polymarket.com"
+POLL_INTERVAL = 3   # seconds between polls per wallet
 
 
 @dataclass
 class CopySignal:
     token_id:        str
-    condition_id:    str          # market condition ID (for CLOB options fetch)
+    condition_id:    str
     title:           str
     outcome:         str
-    price:           float        # price target wallet paid on first detected trade
-    target_size_usd: float        # how much they deployed (for context only)
+    price:           float
+    target_size_usd: float
+    source_wallet:   str        # which trader triggered this
+    source_username: str
+    copy_weight:     float      # trader's copy_weight from their profile
     detected_at:     str = field(default_factory=lambda: datetime.utcnow().strftime("%H:%M:%S"))
 
 
 class WalletMonitor:
     def __init__(self):
-        self._seen_ids:      set[str]               = set()
-        self._copied_tokens: set[str]               = set()
-        self._signal_queue:  asyncio.Queue          = asyncio.Queue()
-        self.latest_feed:    list[dict]             = []   # last 20 raw activity items
-        self._running = False
+        self._seen_ids:      set[str]      = set()     # txn IDs already processed
+        self._copied_tokens: set[str]      = set()     # tokenIds already copied
+        self._signal_queue:  asyncio.Queue = asyncio.Queue()
+        self._wallet_feeds:  dict[str, list] = {}      # address → latest feed items
+        self._wallet_tasks:  dict[str, asyncio.Task]  = {}
+        self._running        = False
+        # Scanner reference injected after init
+        self._scanner        = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -42,41 +53,91 @@ class WalletMonitor:
     def signal_queue(self) -> asyncio.Queue:
         return self._signal_queue
 
+    @property
+    def active_wallets(self) -> list[str]:
+        return list(self._wallet_tasks.keys())
+
+    def get_feed(self, address: str) -> list:
+        return self._wallet_feeds.get(address, [])
+
+    def latest_feed_all(self) -> list[dict]:
+        """Merged feed from all wallets, most recent first."""
+        merged = []
+        for addr, items in self._wallet_feeds.items():
+            for item in items:
+                item = dict(item)
+                item["_wallet"] = addr
+                merged.append(item)
+        merged.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+        return merged[:30]
+
     def mark_copied(self, token_id: str):
-        """Call after placing a copy order so we don't copy the same token twice."""
         self._copied_tokens.add(token_id)
+
+    def set_scanner(self, scanner):
+        """Inject LeaderboardScanner so we can pull approved wallets."""
+        self._scanner = scanner
 
     async def start(self):
         self._running = True
-        logger.info(f"Monitoring {TARGET_WALLET[:10]}…")
+        # Manage wallet tasks — start new ones, cancel removed ones
         while self._running:
-            try:
-                await self._poll()
-            except Exception as e:
-                logger.error(f"Monitor poll error: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+            await self._sync_wallets()
+            await asyncio.sleep(30)   # re-sync every 30s
 
     def stop(self):
         self._running = False
+        for t in self._wallet_tasks.values():
+            t.cancel()
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ── Wallet management ─────────────────────────────────────────────────────
 
-    async def _poll(self):
+    async def _sync_wallets(self):
+        """Add tasks for newly approved wallets, cancel tasks for paused ones."""
+        if self._scanner is None:
+            return
+        approved = set(self._scanner.approved_wallets)
+        current  = set(self._wallet_tasks.keys())
+
+        for addr in approved - current:
+            logger.info(f"Monitor: adding wallet {addr[:10]}…")
+            task = asyncio.create_task(
+                self._poll_wallet(addr), name=f"poll_{addr[:8]}"
+            )
+            self._wallet_tasks[addr] = task
+
+        for addr in current - approved:
+            logger.info(f"Monitor: removing wallet {addr[:10]}…")
+            self._wallet_tasks[addr].cancel()
+            del self._wallet_tasks[addr]
+
+    # ── Per-wallet polling ────────────────────────────────────────────────────
+
+    async def _poll_wallet(self, address: str):
+        logger.info(f"Polling {address[:10]}…")
+        while self._running:
+            try:
+                await self._poll_once(address)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Poll error ({address[:10]}): {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+
+    async def _poll_once(self, address: str):
         url    = f"{DATA_API}/activity"
-        params = {"user": TARGET_WALLET, "limit": "50"}
+        params = {"user": address, "limit": "50"}
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
-                    logger.warning(f"Activity API returned {resp.status}")
                     return
                 data = await resp.json()
 
         if not isinstance(data, list):
             return
 
-        # Keep latest 20 items for the dashboard feed (all activity types)
-        self.latest_feed = data[:20]
+        self._wallet_feeds[address] = data[:20]
 
         for item in data:
             txn_id = str(item.get("id") or item.get("transactionHash") or "")
@@ -84,7 +145,6 @@ class WalletMonitor:
                 continue
             self._seen_ids.add(txn_id)
 
-            # Only act on BUY trades
             if item.get("side") != "BUY":
                 continue
             item_type = (item.get("type") or "").upper()
@@ -95,6 +155,11 @@ class WalletMonitor:
             if not token_id or token_id in self._copied_tokens:
                 continue
 
+            # Get trader profile for copy_weight
+            profile = self._scanner.get_profile(address) if self._scanner else None
+            copy_weight   = profile.copy_weight if profile else 1.0
+            source_user   = profile.username    if profile else address[:10] + "…"
+
             signal = CopySignal(
                 token_id=token_id,
                 condition_id=str(item.get("market") or ""),
@@ -102,11 +167,14 @@ class WalletMonitor:
                 outcome=str(item.get("outcome") or ""),
                 price=float(item.get("price") or 0),
                 target_size_usd=float(item.get("usdcSize") or 0),
+                source_wallet=address,
+                source_username=source_user,
+                copy_weight=copy_weight,
             )
 
             logger.info(
-                f"NEW POSITION DETECTED  {signal.title[:50]}"
-                f"  {signal.outcome}  @ {signal.price:.2f}"
-                f"  (target deployed ${signal.target_size_usd:,.0f})"
+                f"SIGNAL [{source_user}] {signal.title[:45]}"
+                f"  {signal.outcome} @ {signal.price:.2f}"
+                f"  weight={copy_weight:.1f}"
             )
             await self._signal_queue.put(signal)

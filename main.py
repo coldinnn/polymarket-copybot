@@ -1,16 +1,18 @@
 """
-Polymarket Copy Trader — FastAPI dashboard + orchestration.
+Polymarket Multi-Trader Copy Bot — FastAPI dashboard + orchestration.
 
-Mirrors wallet 0xf883… (Inaccuratestake) — #1 on Polymarket leaderboard,
-Roland Garros specialist, $3.9M+ profit this month.
+Automatically scans the Polymarket leaderboard every hour, qualifies
+traders by win rate + sample size + sport focus, then copies their
+positions in real-time (or paper-trades them).
 
 Env vars:
-  POLY_PRIVATE_KEY  — your Polygon EOA private key
-  POLY_WALLET       — your deposit wallet address
-  COPY_SIZE_USD     — $ per copy trade (default: 25)
-  COPY_BANKROLL     — starting bankroll for P&L tracking (default: 500)
-  COPY_PAPER        — "true" (default) or "false" for live trading
-  COPY_MAX_ENTRY    — skip if market mid > this (default: 0.92)
+  POLY_PRIVATE_KEY   — your Polygon EOA private key
+  POLY_WALLET        — your deposit wallet address
+  COPY_SIZE_USD      — base $ per copy trade (default: 25)
+  COPY_SIZE_MAX      — max $ per trade even at weight 2.0 (default: 50)
+  COPY_BANKROLL      — starting bankroll for P&L tracking (default: 500)
+  COPY_PAPER         — "true" (default) or "false" for live trading
+  COPY_MAX_ENTRY     — skip if mid > this after target moves it (default: 0.92)
 """
 import asyncio
 import logging
@@ -20,33 +22,39 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from monitor import WalletMonitor, TARGET_WALLET
+from monitor import WalletMonitor
 from copy_trader import CopyTrader, PAPER_MODE
+from leaderboard_scanner import LeaderboardScanner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ── Global state ───────────────────────────────────────────────────────────────
+_scanner = LeaderboardScanner()
 _monitor = WalletMonitor()
 _trader  = CopyTrader(_monitor)
+_monitor.set_scanner(_scanner)
 
-# ── Lifespan ───────────────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _trader.initialize()
     tasks = [
+        asyncio.create_task(_scanner.start(), name="scanner"),
         asyncio.create_task(_monitor.start(), name="monitor"),
         asyncio.create_task(_trader.start(),  name="trader"),
     ]
     yield
+    _scanner.stop()
     _monitor.stop()
     _trader.stop()
     for t in tasks:
         t.cancel()
 
+
 app = FastAPI(title="Polymarket Copy Trader", lifespan=lifespan)
 
-# ── API endpoints ──────────────────────────────────────────────────────────────
+# ── API ────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -68,11 +76,23 @@ def copy_history():
 def copy_log():
     return JSONResponse(list(reversed(_trader._scan_log)))
 
+@app.get("/copy/trader-stats")
+def copy_trader_stats():
+    return JSONResponse(_trader.trader_stats())
+
 @app.get("/copy/feed")
 def copy_feed():
-    return JSONResponse(_monitor.latest_feed)
+    return JSONResponse(_monitor.latest_feed_all())
 
-# ── Dashboard ─────────────────────────────────────────────────────────────────
+@app.get("/traders")
+def traders():
+    return JSONResponse([p.to_dict() for p in _scanner.all_profiles])
+
+@app.get("/scanner/log")
+def scanner_log():
+    return JSONResponse(list(reversed(_scanner._scan_log)))
+
+# ── Dashboard ──────────────────────────────────────────────────────────────────
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -87,24 +107,26 @@ async def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copy Trader — Inaccuratestake</title>
+<title>Polymarket Copy Trader</title>
 <style>
   :root{{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#e6edf3;
-        --muted:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff}}
+        --muted:#8b949e;--green:#3fb950;--red:#f85149;--yellow:#d29922;--blue:#58a6ff;--purple:#bc8cff}}
   *{{box-sizing:border-box;margin:0;padding:0}}
   body{{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;padding:20px}}
-  h2{{font-size:16px;font-weight:600;margin-bottom:12px;color:var(--text)}}
-  .page-header{{display:flex;align-items:center;gap:12px;margin-bottom:24px;flex-wrap:wrap}}
+  .page-header{{display:flex;align-items:center;gap:12px;margin-bottom:20px;flex-wrap:wrap}}
   .page-header h1{{font-size:20px;font-weight:700}}
-  .target-tag{{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--muted);font-family:monospace}}
-  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:16px}}
-  .card{{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}}
+  .tabs{{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0}}
+  .tab{{padding:8px 16px;cursor:pointer;border-radius:6px 6px 0 0;font-size:13px;font-weight:500;color:var(--muted);border:1px solid transparent;border-bottom:none;margin-bottom:-1px}}
+  .tab.active{{color:var(--text);background:var(--card);border-color:var(--border)}}
+  .tab-content{{display:none}} .tab-content.active{{display:block}}
   .stats-row{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}}
   .stat{{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center}}
   .stat-val{{font-size:22px;font-weight:700;margin-bottom:2px}}
   .stat-label{{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}}
-  .green{{color:var(--green)}} .red{{color:var(--red)}} .yellow{{color:var(--yellow)}} .blue{{color:var(--blue)}}
-  .muted{{color:var(--muted)}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px;margin-bottom:16px}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px}}
+  h2{{font-size:15px;font-weight:600;margin-bottom:12px}}
+  .green{{color:var(--green)}} .red{{color:var(--red)}} .yellow{{color:var(--yellow)}} .blue{{color:var(--blue)}} .purple{{color:var(--purple)}} .muted{{color:var(--muted)}}
   table{{width:100%;border-collapse:collapse;font-size:13px}}
   th{{color:var(--muted);font-weight:500;padding:6px 8px;text-align:left;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase}}
   td{{padding:7px 8px;border-bottom:1px solid #21262d;vertical-align:middle}}
@@ -114,14 +136,15 @@ async def dashboard():
   .badge-red{{background:#3a1a1a;color:var(--red)}}
   .badge-blue{{background:#1a2a3a;color:var(--blue)}}
   .badge-yellow{{background:#3a2e1a;color:var(--yellow)}}
-  .log-entry{{padding:4px 0;border-bottom:1px solid #21262d;font-size:12px;font-family:monospace;color:var(--muted)}}
-  .log-entry .t{{color:#444d56;margin-right:8px}}
-  .log-copy{{color:var(--blue)}} .log-win{{color:var(--green)}} .log-loss{{color:var(--red)}} .log-skip{{color:var(--muted)}}
-  .feed-item{{padding:6px 0;border-bottom:1px solid #21262d;font-size:12px}}
-  .feed-side-buy{{color:var(--green);font-weight:600}} .feed-side-sell{{color:var(--red);font-weight:600}}
-  .feed-redeem{{color:var(--yellow);font-weight:600}}
-  .divider{{height:1px;background:var(--border);margin:16px 0}}
-  #lastUpdate{{font-size:11px;color:var(--muted);margin-bottom:16px}}
+  .badge-purple{{background:#2a1a3a;color:var(--purple)}}
+  .badge-muted{{background:#21262d;color:var(--muted)}}
+  .bar-bg{{background:#21262d;border-radius:3px;height:6px;width:80px;display:inline-block;vertical-align:middle;margin-left:4px}}
+  .bar-fill{{height:6px;border-radius:3px;background:var(--green)}}
+  .log-entry{{padding:4px 0;border-bottom:1px solid #21262d;font-size:12px;font-family:monospace}}
+  .log-t{{color:#444d56;margin-right:8px}}
+  .log-copy{{color:var(--blue)}} .log-win{{color:var(--green)}} .log-loss{{color:var(--red)}} .log-skip{{color:var(--muted)}} .log-scan{{color:var(--yellow)}}
+  .feed-item{{padding:5px 0;border-bottom:1px solid #21262d;font-size:12px}}
+  #lastUpdate{{font-size:11px;color:var(--muted)}}
   @media(max-width:640px){{.stats-row{{grid-template-columns:repeat(2,1fr)}}}}
 </style>
 </head>
@@ -129,68 +152,105 @@ async def dashboard():
 <div class="page-header">
   <h1>📋 Copy Trader</h1>
   {mode_badge}
-  <div class="target-tag">copying {TARGET_WALLET[:10]}… (Inaccuratestake)</div>
   <div id="lastUpdate"></div>
 </div>
 
 <!-- Stats -->
-<div class="stats-row" id="statsGrid">
-  <div class="stat"><div class="stat-val">—</div><div class="stat-label">Bankroll</div></div>
-  <div class="stat"><div class="stat-val">—</div><div class="stat-label">P&amp;L</div></div>
-  <div class="stat"><div class="stat-val">—</div><div class="stat-label">Win Rate</div></div>
-  <div class="stat"><div class="stat-val">—</div><div class="stat-label">Trades</div></div>
+<div class="stats-row" id="statsGrid"></div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('positions')">📂 Positions</div>
+  <div class="tab" onclick="switchTab('traders')">👥 Traders</div>
+  <div class="tab" onclick="switchTab('history')">📜 History</div>
+  <div class="tab" onclick="switchTab('feed')">🔍 Feed</div>
+  <div class="tab" onclick="switchTab('log')">🖥 Log</div>
 </div>
 
-<div class="grid">
-  <!-- Open positions -->
+<!-- Positions tab -->
+<div id="tab-positions" class="tab-content active">
   <div class="card">
-    <h2>📂 Open Positions <span id="openCount" class="muted" style="font-size:13px;font-weight:400"></span></h2>
-    <table><thead><tr><th>Market</th><th>Outcome</th><th>Entry</th><th>Size</th><th>Target @</th></tr></thead>
-    <tbody id="openBody"><tr><td colspan="5" class="muted">No open positions</td></tr></tbody></table>
+    <h2>Open Positions <span id="openCount" class="muted" style="font-size:12px;font-weight:400"></span></h2>
+    <table><thead><tr><th>Market</th><th>Outcome</th><th>Trader</th><th>Entry</th><th>Size</th><th>Target</th></tr></thead>
+    <tbody id="openBody"><tr><td colspan="6" class="muted">No open positions</td></tr></tbody></table>
   </div>
+</div>
 
-  <!-- Target wallet live feed -->
+<!-- Traders tab -->
+<div id="tab-traders" class="tab-content">
+  <div class="card" style="margin-bottom:16px">
+    <h2>Monitored Traders <span id="traderCount" class="muted" style="font-size:12px;font-weight:400"></span></h2>
+    <table>
+      <thead><tr>
+        <th>Trader</th><th>Sport</th><th>Win Rate</th><th>Trades</th>
+        <th>Confidence</th><th>Weight</th><th>Our PnL</th><th>Status</th>
+      </tr></thead>
+      <tbody id="tradersBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody>
+    </table>
+  </div>
   <div class="card">
-    <h2>🔍 Target Wallet Feed <span class="muted" style="font-size:12px;font-weight:400">live · every 3s</span></h2>
+    <h2>Scanner Log</h2>
+    <div id="scannerLog" style="max-height:260px;overflow-y:auto"></div>
+  </div>
+</div>
+
+<!-- History tab -->
+<div id="tab-history" class="tab-content">
+  <div class="card">
+    <h2>Trade History <span id="histCount" class="muted" style="font-size:12px;font-weight:400"></span></h2>
+    <table><thead><tr><th>Market</th><th>Outcome</th><th>Trader</th><th>Entry</th><th>Size</th><th>Result</th><th>P&amp;L</th></tr></thead>
+    <tbody id="histBody"><tr><td colspan="7" class="muted">No completed trades yet</td></tr></tbody></table>
+  </div>
+</div>
+
+<!-- Feed tab -->
+<div id="tab-feed" class="tab-content">
+  <div class="card">
+    <h2>Live Activity Feed <span class="muted" style="font-size:12px;font-weight:400">all monitored wallets · every 3s</span></h2>
     <div id="feedBody"></div>
   </div>
 </div>
 
-<!-- Trade history -->
-<div class="card" style="margin-bottom:16px">
-  <h2>📜 Trade History <span id="histCount" class="muted" style="font-size:13px;font-weight:400"></span></h2>
-  <table><thead><tr><th>Market</th><th>Outcome</th><th>Entry</th><th>Size</th><th>Target @</th><th>Result</th><th>P&amp;L</th></tr></thead>
-  <tbody id="histBody"><tr><td colspan="7" class="muted">No completed trades yet</td></tr></tbody></table>
-</div>
-
-<!-- Scan log -->
-<div class="card">
-  <h2>🖥 Scan Log</h2>
-  <div id="logBody" style="max-height:260px;overflow-y:auto"></div>
+<!-- Log tab -->
+<div id="tab-log" class="tab-content">
+  <div class="card">
+    <h2>Copy Log</h2>
+    <div id="logBody" style="max-height:400px;overflow-y:auto"></div>
+  </div>
 </div>
 
 <script>
 const $ = id => document.getElementById(id);
+let activeTab = 'positions';
 
-function fmt(n, prefix='$') {{
-  if(n===null||n===undefined||n==='') return '—';
-  const v = parseFloat(n);
-  return (prefix||'') + (isNaN(v)?'—':v.toFixed(2));
+function switchTab(name) {{
+  activeTab = name;
+  document.querySelectorAll('.tab').forEach((t,i) => {{
+    const tabs = ['positions','traders','history','feed','log'];
+    t.classList.toggle('active', tabs[i] === name);
+  }});
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  $('tab-' + name)?.classList.add('active');
 }}
 
 async function loadAll() {{
   try {{
-    const [stats, positions, history, log, feed] = await Promise.all([
+    const [stats, positions, history, log, traderStats, traders, scanLog, feed] = await Promise.all([
       fetch('/copy/stats').then(r=>r.json()),
       fetch('/copy/positions').then(r=>r.json()),
       fetch('/copy/history').then(r=>r.json()),
       fetch('/copy/log').then(r=>r.json()),
+      fetch('/copy/trader-stats').then(r=>r.json()),
+      fetch('/traders').then(r=>r.json()),
+      fetch('/scanner/log').then(r=>r.json()),
       fetch('/copy/feed').then(r=>r.json()),
     ]);
     renderStats(stats);
     renderOpen(positions);
     renderHistory(history);
     renderLog(log);
+    renderTraders(traders, traderStats);
+    renderScannerLog(scanLog);
     renderFeed(feed);
     $('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
   }} catch(e) {{ console.error(e); }}
@@ -199,9 +259,9 @@ async function loadAll() {{
 function renderStats(s) {{
   const pnlColor = s.pnl >= 0 ? 'green' : 'red';
   const pnlSign  = s.pnl >= 0 ? '+' : '';
-  const paperTag = s.paper ? ' <span style="font-size:12px;color:var(--yellow)">(paper)</span>' : '';
+  const tag = s.paper ? ' <span style="font-size:11px;color:var(--yellow)">(paper)</span>' : '';
   $('statsGrid').innerHTML = `
-    <div class="stat"><div class="stat-val">${{s.bankroll?.toFixed(2)||'—'}}</div><div class="stat-label">Bankroll${{paperTag}}</div></div>
+    <div class="stat"><div class="stat-val">${{s.bankroll?.toFixed(2)||'—'}}</div><div class="stat-label">Bankroll${{tag}}</div></div>
     <div class="stat"><div class="stat-val ${{pnlColor}}">${{pnlSign}}${{s.pnl?.toFixed(2)||'—'}}</div><div class="stat-label">P&L (${{s.pnl_pct>=0?'+':''}}${{s.pnl_pct?.toFixed(1)||0}}%)</div></div>
     <div class="stat"><div class="stat-val">${{s.win_rate?.toFixed(1)||'—'}}%</div><div class="stat-label">${{s.wins||0}}W / ${{s.losses||0}}L</div></div>
     <div class="stat"><div class="stat-val">${{s.total_trades||0}}</div><div class="stat-label">Settled · ${{s.open||0}} open</div></div>
@@ -211,44 +271,84 @@ function renderStats(s) {{
 function renderOpen(positions) {{
   $('openCount').textContent = positions.length + ' open';
   if(!positions.length) {{
-    $('openBody').innerHTML = '<tr><td colspan="5" class="muted">No open positions</td></tr>';
+    $('openBody').innerHTML = '<tr><td colspan="6" class="muted">No open positions</td></tr>';
     return;
   }}
   $('openBody').innerHTML = positions.map(p => `
     <tr>
-      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.title}}">${{p.title}}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.title}}">${{p.title}}</td>
       <td>${{p.outcome||'—'}}</td>
-      <td class="green">${{p.entry_price?.toFixed(2)||'—'}}¢</td>
-      <td>$${{p.size_usd?.toFixed(2)||'—'}}</td>
-      <td class="muted">${{p.target_price?.toFixed(2)||'—'}}¢ ($${{(p.target_size_usd/1000).toFixed(0)}}K)</td>
+      <td class="blue">${{p.source_username||'—'}}</td>
+      <td class="green">${{p.entry_price?.toFixed(2)}}¢</td>
+      <td>$${{p.size_usd?.toFixed(2)}}</td>
+      <td class="muted">${{p.target_price?.toFixed(2)}}¢</td>
     </tr>
   `).join('');
+}}
+
+function renderTraders(traders, traderStats) {{
+  const tsMap = {{}};
+  (traderStats||[]).forEach(t => {{ tsMap[t.wallet] = t; }});
+
+  $('traderCount').textContent = traders.length + ' tracked';
+  if(!traders.length) {{
+    $('tradersBody').innerHTML = '<tr><td colspan="8" class="muted">Scanning leaderboard…</td></tr>';
+    return;
+  }}
+
+  const sportEmoji = {{tennis:'🎾',football:'⚽',basketball:'🏀',baseball:'⚾',hockey:'🏒',mma:'🥊',crypto:'₿',politics:'🗳️',mixed:'🎯',other:'❓'}};
+
+  $('tradersBody').innerHTML = traders.map(p => {{
+    const statusBadge = {{
+      approved: '<span class="badge badge-green">✓ approved</span>',
+      watching: '<span class="badge badge-yellow">~ watching</span>',
+      rejected: '<span class="badge badge-red">✗ rejected</span>',
+      paused:   '<span class="badge badge-muted">⏸ paused</span>',
+    }}[p.status] || p.status;
+
+    const confPct = Math.round((p.confidence||0)*100);
+    const confBar = `<div class="bar-bg"><div class="bar-fill" style="width:${{confPct}}%"></div></div>`;
+    const wrColor = p.win_rate >= 0.75 ? 'green' : p.win_rate >= 0.60 ? 'yellow' : 'red';
+
+    const ts      = tsMap[p.address] || {{}};
+    const ourPnl  = ts.pnl ?? null;
+    const pnlStr  = ourPnl !== null
+      ? `<span class="${{ourPnl>=0?'green':'red'}}">${{ourPnl>=0?'+':''}}$${{ourPnl.toFixed(2)}}</span>`
+      : '<span class="muted">—</span>';
+
+    return `<tr>
+      <td><strong>${{p.username}}</strong><br><span class="muted" style="font-size:11px;font-family:monospace">${{p.address.substring(0,10)}}…</span></td>
+      <td>${{sportEmoji[p.sport_focus]||'❓'}} ${{p.sport_focus}}</td>
+      <td class="${{wrColor}}">${{(p.win_rate*100).toFixed(1)}}%</td>
+      <td>${{p.wins}}W / ${{p.losses}}L</td>
+      <td>${{confPct}}% ${{confBar}}</td>
+      <td class="purple">${{p.copy_weight?.toFixed(1)}}×</td>
+      <td>${{pnlStr}}</td>
+      <td>${{statusBadge}}</td>
+    </tr>`;
+  }}).join('');
 }}
 
 function renderHistory(history) {{
   $('histCount').textContent = history.length + ' trades';
   if(!history.length) {{
-    $('histBody').innerHTML = '<tr><td colspan="7" class="muted">No completed trades yet</td></tr>';
+    $('histBody').innerHTML = '<tr><td colspan="7" class="muted">No completed trades</td></tr>';
     return;
   }}
   $('histBody').innerHTML = history.map(p => {{
-    const isWin   = p.status === 'won';
-    const badge   = isWin
+    const badge = p.status==='won'
       ? '<span class="badge badge-green">WIN</span>'
       : '<span class="badge badge-red">LOSS</span>';
-    const pnlCol  = isWin ? 'green' : 'red';
-    const pnlSign = p.pnl >= 0 ? '+' : '';
-    return `
-      <tr>
-        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.title}}">${{p.title}}</td>
-        <td>${{p.outcome||'—'}}</td>
-        <td>${{p.entry_price?.toFixed(2)||'—'}}¢</td>
-        <td>$${{p.size_usd?.toFixed(2)||'—'}}</td>
-        <td class="muted">${{p.target_price?.toFixed(2)||'—'}}¢</td>
-        <td>${{badge}}</td>
-        <td class="${{pnlCol}}">${{pnlSign}}$${{Math.abs(p.pnl)?.toFixed(2)||'—'}}</td>
-      </tr>
-    `;
+    const pSign = p.pnl>=0?'+':'';
+    return `<tr>
+      <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${{p.title}}">${{p.title}}</td>
+      <td>${{p.outcome||'—'}}</td>
+      <td class="blue">${{p.source_username||'—'}}</td>
+      <td>${{p.entry_price?.toFixed(2)}}¢</td>
+      <td>$${{p.size_usd?.toFixed(2)}}</td>
+      <td>${{badge}}</td>
+      <td class="${{p.pnl>=0?'green':'red'}}">${{pSign}}$${{Math.abs(p.pnl).toFixed(2)}}</td>
+    </tr>`;
   }}).join('');
 }}
 
@@ -257,13 +357,29 @@ function renderLog(entries) {{
     $('logBody').innerHTML = '<div class="log-entry muted">No activity yet</div>';
     return;
   }}
-  $('logBody').innerHTML = entries.slice(0,50).map(e => {{
-    const msg = e.msg || '';
+  $('logBody').innerHTML = entries.slice(0,80).map(e => {{
+    const msg = e.msg||'';
     let cls = 'log-skip';
-    if(msg.startsWith('COPY'))  cls = 'log-copy';
-    if(msg.startsWith('WIN'))   cls = 'log-win';
-    if(msg.startsWith('LOSS'))  cls = 'log-loss';
-    return `<div class="log-entry"><span class="t">${{e.time}}</span><span class="${{cls}}">${{msg}}</span></div>`;
+    if(msg.startsWith('COPY')) cls='log-copy';
+    if(msg.startsWith('WIN'))  cls='log-win';
+    if(msg.startsWith('LOSS')) cls='log-loss';
+    if(msg.startsWith('SIGNAL')) cls='log-copy';
+    return `<div class="log-entry"><span class="log-t">${{e.time}}</span><span class="${{cls}}">${{msg}}</span></div>`;
+  }}).join('');
+}}
+
+function renderScannerLog(entries) {{
+  if(!entries.length) {{
+    $('scannerLog').innerHTML = '<div class="log-entry muted">No scan activity yet</div>';
+    return;
+  }}
+  $('scannerLog').innerHTML = entries.slice(0,60).map(e => {{
+    const msg = e.msg||'';
+    let cls = 'log-scan';
+    if(msg.includes('APPROVED')) cls='log-win';
+    if(msg.includes('rejected')) cls='log-skip';
+    if(msg.includes('PAUSED'))   cls='log-loss';
+    return `<div class="log-entry"><span class="log-t">${{e.time}}</span><span class="${{cls}}">${{msg}}</span></div>`;
   }}).join('');
 }}
 
@@ -272,38 +388,36 @@ function renderFeed(items) {{
     $('feedBody').innerHTML = '<div class="feed-item muted">No activity yet</div>';
     return;
   }}
-  $('feedBody').innerHTML = items.slice(0,15).map(item => {{
-    const side = (item.side||'').toUpperCase();
-    const type = (item.type||'').toUpperCase();
+  $('feedBody').innerHTML = items.slice(0,25).map(item => {{
+    const side  = (item.side||'').toUpperCase();
+    const type  = (item.type||'').toUpperCase();
     const price = parseFloat(item.price||0);
     const usdc  = parseFloat(item.usdcSize||0);
+    const wallet= (item._wallet||'').substring(0,10)+'…';
 
-    let sideEl = '';
-    if(type === 'REDEEM') {{
-      sideEl = `<span class="feed-redeem">REDEEM</span>`;
-    }} else if(side === 'BUY') {{
-      sideEl = `<span class="feed-side-buy">BUY</span>`;
-    }} else {{
-      sideEl = `<span class="feed-side-sell">SELL</span>`;
-    }}
+    let sideEl = type==='REDEEM'
+      ? '<span style="color:var(--yellow);font-weight:600">REDEEM</span>'
+      : side==='BUY'
+        ? '<span style="color:var(--green);font-weight:600">BUY</span>'
+        : '<span style="color:var(--red);font-weight:600">SELL</span>';
 
-    const title   = (item.title||'').substring(0,45);
-    const outcome = item.outcome || '';
-    const priceStr = price ? ` @ ${{price.toFixed(2)}}` : '';
-    const sizeStr  = usdc  ? ` · $${{usdc>=1000?(usdc/1000).toFixed(0)+'K':usdc.toFixed(0)}}` : '';
-    const ts = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '';
+    const ts    = item.timestamp ? new Date(item.timestamp).toLocaleTimeString() : '';
+    const title = (item.title||'').substring(0,40);
+    const out   = item.outcome||'';
+    const ps    = price ? ` @ ${{price.toFixed(2)}}` : '';
+    const ss    = usdc  ? ` · $${{usdc>=1000?(usdc/1000).toFixed(0)+'K':usdc.toFixed(0)}}` : '';
 
     return `<div class="feed-item">
-      <span style="color:var(--muted);font-size:11px;margin-right:6px">${{ts}}</span>
+      <span class="muted" style="font-size:11px;margin-right:6px">${{ts}}</span>
+      <span class="blue" style="font-size:11px;margin-right:4px">${{wallet}}</span>
       ${{sideEl}}
-      <span style="color:var(--text);margin:0 4px">${{title}}</span>
-      <span style="color:var(--muted)">${{outcome}}</span>
-      <span style="color:var(--yellow)">${{priceStr}}${{sizeStr}}</span>
+      <span style="margin:0 4px">${{title}}</span>
+      <span class="muted">${{out}}</span>
+      <span class="yellow">${{ps}}${{ss}}</span>
     </div>`;
   }}).join('');
 }}
 
-// Load immediately then every 5 seconds
 loadAll();
 setInterval(loadAll, 5000);
 </script>
@@ -314,5 +428,5 @@ setInterval(loadAll, 5000);
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8001"))
-    print(f"  Copy Trader dashboard → http://localhost:{port}")
+    print(f"  Copy Trader → http://localhost:{port}")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

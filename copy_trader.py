@@ -1,15 +1,11 @@
 """
-Places copy orders when WalletMonitor emits a CopySignal.
+Places copy orders based on CopySignals from WalletMonitor.
 
-COPY_PAPER=true  → simulate orders, no real CLOB calls (default for safety)
-COPY_PAPER=false → live mode, real orders placed
+Copy size = COPY_SIZE_USD * signal.copy_weight (capped at COPY_SIZE_MAX).
+Higher-confidence traders get proportionally larger positions.
 
-Position lifecycle:
-  open → won  (market resolved, our outcome token is redeemable at $1.00)
-  open → lost (market resolved, our outcome token is worthless)
-
-Redemption is handled by the existing redeemer.py logic in the main bot.
-Here we just track P&L by querying the positions API periodically.
+COPY_PAPER=true  → simulate orders (default)
+COPY_PAPER=false → live CLOB orders
 """
 import asyncio
 import logging
@@ -24,36 +20,38 @@ from monitor import WalletMonitor, CopySignal
 
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-CLOB_HOST     = "https://clob.polymarket.com"
-DATA_API      = "https://data-api.polymarket.com"
-CHAIN_ID      = 137
+CLOB_HOST      = "https://clob.polymarket.com"
+DATA_API       = "https://data-api.polymarket.com"
+CHAIN_ID       = 137
 
-COPY_SIZE_USD = float(os.getenv("COPY_SIZE_USD", "25"))   # $ per copy trade
-MAX_ENTRY     = float(os.getenv("COPY_MAX_ENTRY", "0.92"))  # skip if market moved above this
-MIN_ENTRY     = float(os.getenv("COPY_MIN_ENTRY", "0.05"))  # skip if suspiciously cheap
-PAPER_MODE    = os.getenv("COPY_PAPER", "true").lower() != "false"
-
-RESOLVE_INTERVAL = 300  # check for resolved positions every 5 min
+COPY_SIZE_USD  = float(os.getenv("COPY_SIZE_USD",  "25"))
+COPY_SIZE_MAX  = float(os.getenv("COPY_SIZE_MAX",  "50"))
+MAX_ENTRY      = float(os.getenv("COPY_MAX_ENTRY", "0.92"))
+MIN_ENTRY      = float(os.getenv("COPY_MIN_ENTRY", "0.05"))
+PAPER_MODE     = os.getenv("COPY_PAPER", "true").lower() != "false"
+RESOLVE_INTERVAL = 300
 
 
 @dataclass
 class CopyPosition:
-    token_id:          str
-    condition_id:      str
-    title:             str
-    outcome:           str
-    entry_price:       float
-    size_usd:          float
-    shares:            int
-    target_price:      float   # what the target wallet paid
-    target_size_usd:   float
-    entered_at:        str
-    paper:             bool
-    status:            str = "open"   # open | won | lost
-    pnl:               float = 0.0
-    exit_price:        float = 0.0
-    resolved_at:       str = ""
+    token_id:        str
+    condition_id:    str
+    title:           str
+    outcome:         str
+    entry_price:     float
+    size_usd:        float
+    shares:          int
+    target_price:    float
+    target_size_usd: float
+    source_wallet:   str
+    source_username: str
+    copy_weight:     float
+    entered_at:      str
+    paper:           bool
+    status:          str   = "open"   # open | won | lost
+    pnl:             float = 0.0
+    exit_price:      float = 0.0
+    resolved_at:     str   = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -62,20 +60,19 @@ class CopyPosition:
 class CopyTrader:
     def __init__(self, monitor: WalletMonitor):
         self.monitor   = monitor
-        self._client   = None    # ClobClient, None in paper mode
+        self._client   = None
         self._lock     = asyncio.Lock()
         self._running  = False
         self.positions: list[CopyPosition] = []
         self.history:   list[CopyPosition] = []
         self._scan_log: list[dict]         = []
         self._bankroll  = float(os.getenv("COPY_BANKROLL", "500"))
-        self._deployed  = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def initialize(self):
         if PAPER_MODE:
-            logger.info("CopyTrader running in PAPER mode (set COPY_PAPER=false for live)")
+            logger.info("CopyTrader: PAPER mode (set COPY_PAPER=false for live)")
             return
         try:
             from py_clob_client_v2 import ClobClient
@@ -88,7 +85,7 @@ class CopyTrader:
                 CLOB_HOST, chain_id=CHAIN_ID, key=pk,
                 creds=creds, signature_type=0,
             )
-            logger.info("CopyTrader CLOB client ready (LIVE)")
+            logger.info("CopyTrader: LIVE mode")
         except Exception as e:
             logger.error(f"CLOB init failed, falling back to paper: {e}")
 
@@ -118,33 +115,28 @@ class CopyTrader:
 
     async def _copy(self, signal: CopySignal):
         async with self._lock:
-            # Already have this token
             if any(p.token_id == signal.token_id for p in self.positions):
                 return
 
-            # Fetch current mid — don't buy if target already moved the market
             mid = await self._get_mid(signal.token_id)
             if mid is None:
-                self._log(f"SKIP {signal.title[:40]}: could not fetch mid")
+                self._log(f"SKIP {signal.title[:40]}: no mid price")
                 return
-
             if mid > MAX_ENTRY:
-                self._log(f"SKIP {signal.title[:40]}: mid {mid:.2f} > max {MAX_ENTRY}")
+                self._log(f"SKIP {signal.title[:40]}: mid {mid:.2f} > {MAX_ENTRY} max")
                 return
             if mid < MIN_ENTRY:
-                self._log(f"SKIP {signal.title[:40]}: mid {mid:.2f} < min {MIN_ENTRY}")
+                self._log(f"SKIP {signal.title[:40]}: mid {mid:.2f} < {MIN_ENTRY} min")
                 return
 
-            # Lift ask slightly to guarantee FOK fill
-            price  = round(min(mid + 0.01, 0.99), 2)
-            shares = int(COPY_SIZE_USD / price)
+            # Weighted copy size — higher confidence traders get larger copies
+            raw_size = min(COPY_SIZE_USD * signal.copy_weight, COPY_SIZE_MAX)
+            price    = round(min(mid + 0.01, 0.99), 2)
+            shares   = int(raw_size / price)
             if shares < 1:
-                self._log(f"SKIP {signal.title[:40]}: shares=0 at price {price}")
                 return
-
             actual_cost = round(price * shares, 2)
 
-            # ── Place order ────────────────────────────────────────────────────
             paper = PAPER_MODE or self._client is None
             if not paper:
                 placed = await self._place_live_order(signal.token_id, price, shares)
@@ -162,18 +154,20 @@ class CopyTrader:
                 shares=shares,
                 target_price=signal.price,
                 target_size_usd=signal.target_size_usd,
+                source_wallet=signal.source_wallet,
+                source_username=signal.source_username,
+                copy_weight=signal.copy_weight,
                 entered_at=datetime.utcnow().strftime("%H:%M:%S"),
                 paper=paper,
             )
             self.positions.append(pos)
             self.monitor.mark_copied(signal.token_id)
-            self._deployed += actual_cost
 
             tag = "PAPER" if paper else "LIVE"
             self._log(
-                f"COPY [{tag}] {pos.title[:45]}  {pos.outcome}"
-                f"  ${actual_cost:.2f} @ {price:.2f}"
-                f"  (target @ {signal.price:.2f}, ${signal.target_size_usd:,.0f})"
+                f"COPY [{tag}] [{signal.source_username}] {pos.title[:40]}"
+                f"  {pos.outcome}  ${actual_cost:.2f} @ {price:.2f}"
+                f"  (target @ {signal.price:.2f}  weight={signal.copy_weight:.1f})"
             )
 
     async def _place_live_order(self, token_id: str, price: float, shares: int) -> bool:
@@ -205,75 +199,59 @@ class CopyTrader:
                 logger.error(f"Resolve loop error: {e}")
 
     async def _check_resolved(self):
-        """
-        Check target wallet's recent activity for REDEEM events.
-        A REDEEM by the target means their market resolved — look up whether
-        our position in that market won or lost.
-        """
         if not self.positions:
             return
-
-        # Fetch target wallet recent activity to find REDEEMs
-        url    = f"{DATA_API}/activity"
-        params = {"user": self.monitor.__class__.__module__, "limit": "100"}
-
-        # Get target wallet activity to detect resolves
-        from monitor import TARGET_WALLET
-        params = {"user": TARGET_WALLET, "limit": "100"}
+        from monitor import DATA_API as _DATA_API
+        # Collect condition IDs that have been redeemed by any source wallet
+        source_wallets = list({p.source_wallet for p in self.positions})
         redeemed_conditions: set[str] = set()
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as resp:
-                    if resp.status == 200:
+        for wallet in source_wallets:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{_DATA_API}/activity",
+                        params={"user": wallet, "limit": "100"},
+                    ) as resp:
+                        if resp.status != 200:
+                            continue
                         data = await resp.json()
                         for item in (data if isinstance(data, list) else []):
-                            if (item.get("type") or "").upper() in ("REDEEM",):
+                            if (item.get("type") or "").upper() == "REDEEM":
                                 cid = str(item.get("market") or item.get("conditionId") or "")
                                 if cid:
                                     redeemed_conditions.add(cid)
-        except Exception as e:
-            logger.error(f"Resolve fetch error: {e}")
-            return
+            except Exception as e:
+                logger.error(f"Resolve fetch error for {wallet[:10]}: {e}")
 
         if not redeemed_conditions:
             return
 
-        # For each open position whose conditionId was redeemed by target,
-        # check if OUR shares are redeemable (won) or worthless (lost)
         async with self._lock:
             still_open = []
             for pos in self.positions:
                 if pos.condition_id not in redeemed_conditions:
                     still_open.append(pos)
                     continue
-
-                # Market resolved — check our position
                 won = await self._is_redeemable(pos.token_id)
                 if won is None:
-                    # Can't determine yet, keep open
                     still_open.append(pos)
                     continue
-
                 pos.resolved_at = datetime.utcnow().strftime("%H:%M:%S")
                 if won:
                     pos.status     = "won"
                     pos.exit_price = 1.0
                     pos.pnl        = round(pos.shares * 1.0 - pos.size_usd, 2)
-                    self._log(f"WIN  {pos.title[:45]}  +${pos.pnl:.2f}")
+                    self._log(f"WIN  [{pos.source_username}] {pos.title[:40]}  +${pos.pnl:.2f}")
                 else:
                     pos.status     = "lost"
                     pos.exit_price = 0.0
                     pos.pnl        = -pos.size_usd
-                    self._log(f"LOSS  {pos.title[:45]}  -${pos.size_usd:.2f}")
-
+                    self._log(f"LOSS [{pos.source_username}] {pos.title[:40]}  -${pos.size_usd:.2f}")
                 self.history.append(pos)
-
             self.positions = still_open
 
     async def _is_redeemable(self, token_id: str) -> Optional[bool]:
-        """Check if this token_id appears as redeemable in our positions."""
-        pk = os.getenv("POLY_PRIVATE_KEY", "")
         wallet = os.getenv("POLY_WALLET", "")
         if not wallet and self._client:
             try:
@@ -282,12 +260,12 @@ class CopyTrader:
                 pass
         if not wallet:
             return None
-
-        url    = f"{DATA_API}/positions"
-        params = {"user": wallet, "limit": "500"}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as resp:
+                async with session.get(
+                    f"{DATA_API}/positions",
+                    params={"user": wallet, "limit": "500"},
+                ) as resp:
                     if resp.status != 200:
                         return None
                     data = await resp.json()
@@ -295,20 +273,18 @@ class CopyTrader:
                         tid = str(p.get("asset_id") or p.get("tokenId") or "")
                         if tid == token_id:
                             return bool(p.get("redeemable"))
-                    # Token not in portfolio at all → worthless (lost)
                     return False
         except Exception:
             return None
 
-    # ── Stats / helpers ───────────────────────────────────────────────────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        closed = self.history
-        wins   = [p for p in closed if p.status == "won"]
-        losses = [p for p in closed if p.status == "lost"]
-        total_pnl    = sum(p.pnl for p in closed)
-        win_rate     = (len(wins) / len(closed) * 100) if closed else 0.0
-        total_trades = len(closed)
+        closed   = self.history
+        wins     = [p for p in closed if p.status == "won"]
+        losses   = [p for p in closed if p.status == "lost"]
+        total_pnl = sum(p.pnl for p in closed)
+        win_rate  = (len(wins) / len(closed) * 100) if closed else 0.0
         return {
             "bankroll":     round(self._bankroll + total_pnl, 2),
             "started":      self._bankroll,
@@ -318,10 +294,35 @@ class CopyTrader:
             "wins":         len(wins),
             "losses":       len(losses),
             "open":         len(self.positions),
-            "total_trades": total_trades,
+            "total_trades": len(closed),
             "copy_size":    COPY_SIZE_USD,
             "paper":        PAPER_MODE,
         }
+
+    # ── Per-trader breakdown ──────────────────────────────────────────────────
+
+    def trader_stats(self) -> list[dict]:
+        """Win/loss/PnL breakdown per source trader."""
+        wallets: dict[str, dict] = {}
+        for p in self.history + self.positions:
+            w = p.source_wallet
+            if w not in wallets:
+                wallets[w] = {
+                    "username": p.source_username,
+                    "wallet":   w,
+                    "wins": 0, "losses": 0, "open": 0, "pnl": 0.0,
+                }
+            if p.status == "won":
+                wallets[w]["wins"]   += 1
+                wallets[w]["pnl"]    += p.pnl
+            elif p.status == "lost":
+                wallets[w]["losses"] += 1
+                wallets[w]["pnl"]    += p.pnl
+            else:
+                wallets[w]["open"]   += 1
+        return sorted(wallets.values(), key=lambda x: -x["pnl"])
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str):
         entry = {"time": datetime.utcnow().strftime("%H:%M:%S"), "msg": msg}
@@ -334,7 +335,8 @@ class CopyTrader:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{CLOB_HOST}/midpoint", params={"token_id": token_id},
+                    f"{CLOB_HOST}/midpoint",
+                    params={"token_id": token_id},
                     timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     if resp.status != 200:
