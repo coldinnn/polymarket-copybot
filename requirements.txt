@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+aiohttp>=3.9
+py-clob-client-v2
