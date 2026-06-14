@@ -94,49 +94,46 @@ class TraderAnalyzer:
         now_str = datetime.now(timezone.utc).isoformat()
 
         # ── Split into buys and redemptions ───────────────────────────────────
+        # API fields: asset=tokenId, conditionId=market, type=TRADE|REDEEM
         buys    = [i for i in items if i.get("side") == "BUY"
-                   and (i.get("type") or "").upper() in ("TRADE", "")]
+                   and (i.get("type") or "").upper() == "TRADE"]
         redeems = [i for i in items if (i.get("type") or "").upper() == "REDEEM"]
 
-        # ── Identify unique positions (by tokenId) ────────────────────────────
-        # Each tokenId = one outcome in one market
-        # First BUY per tokenId = position entry
-        seen_tokens:  dict[str, dict] = {}
+        # ── Identify unique positions (by conditionId = one market) ───────────
+        # Multiple BUYs in same conditionId = adding to the same position.
+        # First BUY per conditionId = position entry.
+        seen_conditions: dict[str, dict] = {}
         for b in buys:
-            tid = str(b.get("tokenId") or b.get("asset_id") or "")
-            if tid and tid not in seen_tokens:
-                seen_tokens[tid] = b
+            cid = str(b.get("conditionId") or "")
+            if cid and cid not in seen_conditions:
+                seen_conditions[cid] = b
 
-        # ── Determine wins/losses ─────────────────────────────────────────────
-        # A tokenId that appears in REDEEMs = winning position
-        redeemed_tokens: set[str] = set()
+        # ── Determine wins via REDEEMs ────────────────────────────────────────
+        # A REDEEM with conditionId X means we held winning tokens for market X.
+        # (Losers never redeem — worthless tokens are just abandoned.)
+        redeemed_conditions: set[str] = set()
         for r in redeems:
-            tid = str(r.get("tokenId") or r.get("asset_id") or "")
-            if tid:
-                redeemed_tokens.add(tid)
+            cid = str(r.get("conditionId") or "")
+            if cid:
+                redeemed_conditions.add(cid)
 
-        # We can only score positions that have resolved.
-        # We infer "lost" when a token has NOT been redeemed AND the market
-        # has likely resolved (the target wallet has been active since).
-        # Conservative: only count explicit wins from redeems.
-        # For losses we need to cross-reference positions API — but for now
-        # use a heuristic: total_trades from profile vs visible wins.
-        wins   = len(redeemed_tokens & set(seen_tokens.keys()))
-        # Note: losses are hard to detect on-chain so we use total_trades
-        # from the profile API as the denominator when available.
-        total_positions = len(seen_tokens)
+        wins            = len(redeemed_conditions & set(seen_conditions.keys()))
+        total_positions = len(seen_conditions)
+        # losses = positions entered but not redeemed
+        # Note: open positions are also "not redeemed", so this slightly
+        # overestimates losses, but is conservative (better than overrating).
         losses = max(0, total_positions - wins)
 
         total_trades = wins + losses
         win_rate = wins / total_trades if total_trades > 0 else 0.0
 
         # ── Average entry price ───────────────────────────────────────────────
-        prices = [float(b.get("price") or 0) for b in seen_tokens.values() if b.get("price")]
+        prices = [float(b.get("price") or 0) for b in seen_conditions.values() if b.get("price")]
         avg_entry = sum(prices) / len(prices) if prices else 0.0
 
         # ── Sport / category detection ────────────────────────────────────────
         sport_counts: dict[str, int] = {}
-        for b in seen_tokens.values():
+        for b in seen_conditions.values():
             title = (b.get("title") or b.get("question") or "").lower()
             sport = _detect_sport(title)
             sport_counts[sport] = sport_counts.get(sport, 0) + 1
@@ -150,10 +147,10 @@ class TraderAnalyzer:
         # ── Profit estimate ───────────────────────────────────────────────────
         # Rough: each win returns $1/share, each entry paid avg_entry/share
         # We don't have exact share counts, so estimate from usdcSize
-        total_invested = sum(float(b.get("usdcSize") or 0) for b in seen_tokens.values())
+        total_invested = sum(float(b.get("usdcSize") or 0) for b in seen_conditions.values())
         win_invested   = sum(
-            float(seen_tokens[tid].get("usdcSize") or 0)
-            for tid in redeemed_tokens & set(seen_tokens.keys())
+            float(seen_conditions[cid].get("usdcSize") or 0)
+            for cid in redeemed_conditions & set(seen_conditions.keys())
         )
         est_win_return = (win_invested / avg_entry) if avg_entry > 0 else 0
         total_profit   = round(est_win_return - total_invested, 2) if total_invested else 0.0

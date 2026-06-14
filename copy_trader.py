@@ -218,7 +218,7 @@ class CopyTrader:
                         data = await resp.json()
                         for item in (data if isinstance(data, list) else []):
                             if (item.get("type") or "").upper() == "REDEEM":
-                                cid = str(item.get("market") or item.get("conditionId") or "")
+                                cid = str(item.get("conditionId") or "")
                                 if cid:
                                     redeemed_conditions.add(cid)
             except Exception as e:

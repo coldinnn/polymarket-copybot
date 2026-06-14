@@ -147,11 +147,10 @@ class WalletMonitor:
 
             if item.get("side") != "BUY":
                 continue
-            item_type = (item.get("type") or "").upper()
-            if item_type not in ("TRADE", ""):
+            if (item.get("type") or "").upper() != "TRADE":
                 continue
 
-            token_id = str(item.get("tokenId") or item.get("asset_id") or "")
+            token_id = str(item.get("asset") or "")
             if not token_id or token_id in self._copied_tokens:
                 continue
 
@@ -162,7 +161,7 @@ class WalletMonitor:
 
             signal = CopySignal(
                 token_id=token_id,
-                condition_id=str(item.get("market") or ""),
+                condition_id=str(item.get("conditionId") or ""),
                 title=str(item.get("title") or "Unknown market"),
                 outcome=str(item.get("outcome") or ""),
                 price=float(item.get("price") or 0),
