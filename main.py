@@ -234,26 +234,25 @@ function switchTab(name) {{
 }}
 
 async function loadAll() {{
-  try {{
-    const [stats, positions, history, log, traderStats, traders, scanLog, feed] = await Promise.all([
-      fetch('/copy/stats').then(r=>r.json()),
-      fetch('/copy/positions').then(r=>r.json()),
-      fetch('/copy/history').then(r=>r.json()),
-      fetch('/copy/log').then(r=>r.json()),
-      fetch('/copy/trader-stats').then(r=>r.json()),
-      fetch('/traders').then(r=>r.json()),
-      fetch('/scanner/log').then(r=>r.json()),
-      fetch('/copy/feed').then(r=>r.json()),
-    ]);
-    renderStats(stats);
-    renderOpen(positions);
-    renderHistory(history);
-    renderLog(log);
-    renderTraders(traders, traderStats);
-    renderScannerLog(scanLog);
-    renderFeed(feed);
-    $('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
-  }} catch(e) {{ console.error(e); }}
+  const safe = url => fetch(url).then(r=>r.json()).catch(()=>null);
+  const [stats, positions, history, log, traderStats, traders, scanLog, feed] = await Promise.all([
+    safe('/copy/stats'),
+    safe('/copy/positions'),
+    safe('/copy/history'),
+    safe('/copy/log'),
+    safe('/copy/trader-stats'),
+    safe('/traders'),
+    safe('/scanner/log'),
+    safe('/copy/feed'),
+  ]);
+  try {{ if(stats)     renderStats(stats);                    }} catch(e){{console.error('stats',e)}}
+  try {{ if(positions) renderOpen(positions);                 }} catch(e){{console.error('open',e)}}
+  try {{ if(history)   renderHistory(history);                }} catch(e){{console.error('hist',e)}}
+  try {{ if(log)       renderLog(log);                        }} catch(e){{console.error('log',e)}}
+  try {{ if(traders)   renderTraders(traders, traderStats||[]); }} catch(e){{console.error('traders',e)}}
+  try {{ if(scanLog)   renderScannerLog(scanLog);             }} catch(e){{console.error('scanlog',e)}}
+  try {{ if(feed)      renderFeed(feed);                      }} catch(e){{console.error('feed',e)}}
+  $('lastUpdate').textContent = 'Updated ' + new Date().toLocaleTimeString();
 }}
 
 function renderStats(s) {{
