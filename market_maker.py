@@ -128,8 +128,9 @@ CLOB_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 class MarketMaker:
-    def __init__(self, token_id: str):
+    def __init__(self, token_id: str, label: str = ""):
         self.token_id   = token_id
+        self.label      = label or f"…{token_id[-8:]}"
         self._client    = None
         self._running   = False
         self.quote:     Optional[Quote]  = None
