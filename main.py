@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from monitor import WalletMonitor
 from copy_trader import CopyTrader, PAPER_MODE
 from leaderboard_scanner import LeaderboardScanner
+from market_maker import MarketMaker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ _monitor = WalletMonitor()
 _trader  = CopyTrader(_monitor)
 _monitor.set_scanner(_scanner)
 
+# Market maker — only active when MM_TOKEN_ID is set
+_mm_token = os.getenv("MM_TOKEN_ID", "")
+_mm: MarketMaker | None = MarketMaker(_mm_token) if _mm_token else None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -44,10 +49,16 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_monitor.start(), name="monitor"),
         asyncio.create_task(_trader.start(),  name="trader"),
     ]
+    if _mm:
+        _mm.initialize()
+        tasks.append(asyncio.create_task(_mm.run(), name="market_maker"))
+        logger.info(f"Market maker started on token {_mm_token[:20]}...")
     yield
     _scanner.stop()
     _monitor.stop()
     _trader.stop()
+    if _mm:
+        _mm.stop()
     for t in tasks:
         t.cancel()
 
@@ -83,6 +94,38 @@ def copy_trader_stats():
 @app.get("/copy/feed")
 def copy_feed():
     return JSONResponse(_monitor.latest_feed_all())
+
+# ── Market Maker API ───────────────────────────────────────────────────────────
+
+@app.get("/mm/status")
+async def mm_status():
+    if not _mm:
+        return JSONResponse({"active": False, "reason": "MM_TOKEN_ID not set"})
+    mid = await _mm._get_mid()
+    return JSONResponse({
+        "active":       True,
+        "paper":        os.getenv("MM_PAPER", "true").lower() != "false",
+        "token_id":     _mm_token[:30] + "...",
+        "live_mid":     _mm._live_mid,
+        "quote":        {
+            "bid":       _mm.quote.bid_price  if _mm.quote else None,
+            "ask":       _mm.quote.ask_price  if _mm.quote else None,
+            "bid_shares": _mm.quote.bid_shares if _mm.quote else None,
+            "ask_shares": _mm.quote.ask_shares if _mm.quote else None,
+        } if _mm.quote else None,
+        "stats": {
+            "quotes_posted": _mm.stats.quotes_posted,
+            "requotes":      _mm.stats.requotes,
+            "bid_fills":     len([f for f in _mm.stats.fills if f.side == "bid"]),
+            "ask_fills":     len([f for f in _mm.stats.fills if f.side == "ask"]),
+            "net_shares":    _mm.stats.net_shares,
+            "pnl":           _mm.stats.pnl(mid or 0.5),
+        },
+        "fill_log": [
+            {"side": f.side, "price": f.price, "shares": f.shares, "at": f.filled_at}
+            for f in _mm.stats.fills[-20:]
+        ],
+    })
 
 @app.get("/traders")
 def traders():
@@ -165,6 +208,7 @@ async def dashboard():
   <div class="tab" onclick="switchTab('history')">📜 History</div>
   <div class="tab" onclick="switchTab('feed')">🔍 Feed</div>
   <div class="tab" onclick="switchTab('log')">🖥 Log</div>
+  <div class="tab" onclick="switchTab('mm')">📈 Market Maker</div>
 </div>
 
 <!-- Positions tab -->
@@ -219,6 +263,28 @@ async def dashboard():
   </div>
 </div>
 
+<!-- Market Maker tab -->
+<div id="tab-mm" class="tab-content">
+  <div class="stats-row" id="mmStats" style="grid-template-columns:repeat(5,1fr)"></div>
+  <div class="grid" style="grid-template-columns:1fr 1fr">
+    <div class="card">
+      <h2>Current Quote</h2>
+      <div id="mmQuote"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="card">
+      <h2>Market</h2>
+      <div id="mmMarket"><span class="muted">Loading…</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Fill Log <span id="mmFillCount" class="muted" style="font-size:12px;font-weight:400"></span></h2>
+    <table>
+      <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Shares</th></tr></thead>
+      <tbody id="mmFillBody"><tr><td colspan="4" class="muted">No fills yet — waiting for mid to cross 0.48 or 0.52</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
 let activeTab = 'positions';
@@ -226,7 +292,7 @@ let activeTab = 'positions';
 function switchTab(name) {{
   activeTab = name;
   document.querySelectorAll('.tab').forEach((t,i) => {{
-    const tabs = ['positions','traders','history','feed','log'];
+    const tabs = ['positions','traders','history','feed','log','mm'];
     t.classList.toggle('active', tabs[i] === name);
   }});
   document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -235,7 +301,7 @@ function switchTab(name) {{
 
 async function loadAll() {{
   const safe = url => fetch(url).then(r=>r.json()).catch(()=>null);
-  const [stats, positions, history, log, traderStats, traders, scanLog, feed] = await Promise.all([
+  const [stats, positions, history, log, traderStats, traders, scanLog, feed, mm] = await Promise.all([
     safe('/copy/stats'),
     safe('/copy/positions'),
     safe('/copy/history'),
@@ -244,11 +310,13 @@ async function loadAll() {{
     safe('/traders'),
     safe('/scanner/log'),
     safe('/copy/feed'),
+    safe('/mm/status'),
   ]);
   try {{ if(stats)     renderStats(stats);                    }} catch(e){{console.error('stats',e)}}
   try {{ if(positions) renderOpen(positions);                 }} catch(e){{console.error('open',e)}}
   try {{ if(history)   renderHistory(history);                }} catch(e){{console.error('hist',e)}}
   try {{ if(log)       renderLog(log);                        }} catch(e){{console.error('log',e)}}
+  try {{ if(mm)        renderMM(mm);                          }} catch(e){{console.error('mm',e)}}
   try {{ if(traders)   renderTraders(traders, traderStats||[]); }} catch(e){{console.error('traders',e)}}
   try {{ if(scanLog)   renderScannerLog(scanLog);             }} catch(e){{console.error('scanlog',e)}}
   try {{ if(feed)      renderFeed(feed);                      }} catch(e){{console.error('feed',e)}}
@@ -414,6 +482,105 @@ function renderFeed(items) {{
       <span class="muted">${{out}}</span>
       <span class="yellow">${{ps}}${{ss}}</span>
     </div>`;
+  }}).join('');
+}}
+
+function renderMM(d) {{
+  if (!d || !d.active) {{
+    $('mmStats').innerHTML = '<div class="stat"><div class="stat-val muted">—</div><div class="stat-label">MM not active</div></div>';
+    return;
+  }}
+  const s      = d.stats || {{}};
+  const q      = d.quote || {{}};
+  const mid    = d.live_mid ?? '—';
+  const pnl    = s.pnl ?? 0;
+  const pnlCol = pnl >= 0 ? 'green' : 'red';
+  const pnlSign= pnl >= 0 ? '+' : '';
+  const modeBadge = d.paper
+    ? '<span class="badge badge-yellow">PAPER</span>'
+    : '<span class="badge badge-red">LIVE</span>';
+
+  // Stats row
+  $('mmStats').innerHTML = `
+    <div class="stat">
+      <div class="stat-val ${{pnlCol}}">${{pnlSign}}$${{pnl.toFixed(4)}}</div>
+      <div class="stat-label">P&L (USDC)</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val">${{s.bid_fills ?? 0}} / ${{s.ask_fills ?? 0}}</div>
+      <div class="stat-label">Bid / Ask Fills</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val ${{s.net_shares > 0 ? 'green' : s.net_shares < 0 ? 'red' : ''}}">${{s.net_shares >= 0 ? '+' : ''}}${{s.net_shares ?? 0}}</div>
+      <div class="stat-label">Net Inventory (shares)</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val">${{s.quotes_posted ?? 0}}</div>
+      <div class="stat-label">Quotes Posted</div>
+    </div>
+    <div class="stat">
+      <div class="stat-val blue">${{typeof mid === 'number' ? mid.toFixed(3) : mid}}</div>
+      <div class="stat-label">Live Mid</div>
+    </div>
+  `;
+
+  // Quote card
+  if (q.bid) {{
+    const spread = q.ask && q.bid ? ((q.ask - q.bid) * 100).toFixed(1) : '—';
+    $('mmQuote').innerHTML = `
+      <div style="display:flex;gap:24px;align-items:center;margin-bottom:12px">
+        <div style="text-align:center">
+          <div style="font-size:28px;font-weight:700;color:var(--green)">${{q.bid?.toFixed(3)}}</div>
+          <div class="muted" style="font-size:11px">BID × ${{q.bid_shares}} shares</div>
+        </div>
+        <div style="text-align:center;color:var(--muted)">
+          <div style="font-size:14px">——  ${{spread}}¢ spread  ——</div>
+          <div style="font-size:11px;margin-top:4px">mid ${{typeof mid === 'number' ? mid.toFixed(3) : mid}}</div>
+        </div>
+        <div style="text-align:center">
+          <div style="font-size:28px;font-weight:700;color:var(--red)">${{q.ask?.toFixed(3)}}</div>
+          <div class="muted" style="font-size:11px">ASK × ${{q.ask_shares}} shares</div>
+        </div>
+      </div>
+      <div style="font-size:12px;color:var(--muted)">Fills when mid crosses these levels ${{modeBadge}}</div>
+    `;
+  }} else {{
+    $('mmQuote').innerHTML = '<span class="muted">No active quote</span>';
+  }}
+
+  // Market info card
+  $('mmMarket').innerHTML = `
+    <div style="font-size:12px;margin-bottom:8px">
+      <span class="muted">Token: </span><span style="font-family:monospace;font-size:11px">${{d.token_id}}</span>
+    </div>
+    <div style="font-size:12px;margin-bottom:4px">
+      <span class="muted">Mode: </span>${{modeBadge}}
+    </div>
+    <div style="font-size:12px;margin-bottom:4px">
+      <span class="muted">Requotes: </span>${{s.requotes ?? 0}}
+    </div>
+    <div style="font-size:12px">
+      <span class="muted">Status: </span>
+      <span class="green">● quoting</span>
+    </div>
+  `;
+
+  // Fill log
+  const fills = d.fill_log || [];
+  $('mmFillCount').textContent = fills.length + ' fills total';
+  if (!fills.length) {{
+    $('mmFillBody').innerHTML = '<tr><td colspan="4" class="muted">No fills yet — price must cross 0.48 (bid) or 0.52 (ask)</td></tr>';
+    return;
+  }}
+  $('mmFillBody').innerHTML = [...fills].reverse().map(f => {{
+    const cls = f.side === 'bid' ? 'green' : 'red';
+    const arrow = f.side === 'bid' ? '▼ BID' : '▲ ASK';
+    return `<tr>
+      <td class="muted">${{f.at}}</td>
+      <td><span class="${{cls}}" style="font-weight:600">${{arrow}}</span></td>
+      <td>${{f.price?.toFixed(3)}}</td>
+      <td>${{f.shares}}</td>
+    </tr>`;
   }}).join('');
 }}
 
