@@ -453,8 +453,10 @@ class MarketMaker:
                                 bids = msg.get("bids", [])
                                 asks = msg.get("asks", [])
                                 if bids and asks:
-                                    best_bid = float(bids[0]["price"])
-                                    best_ask = float(asks[0]["price"])
+                                    # Polymarket WS: bids sorted low→high (best = last),
+                                    # asks sorted high→low (best = last).
+                                    best_bid = float(bids[-1]["price"])
+                                    best_ask = float(asks[-1]["price"])
                                     self._live_mid = round((best_bid + best_ask) / 2, 4)
                         except Exception:
                             pass
@@ -468,9 +470,12 @@ class MarketMaker:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _get_mid(self) -> Optional[float]:
-        # Prefer live WebSocket mid (μs latency) over REST (100-500ms)
-        if self._live_mid is not None:
-            return self._live_mid
+        """
+        Always use REST /midpoint as the authoritative source.
+        WebSocket mid is stored in _live_mid for reference only — the WS orderbook
+        sorts bids low→high and asks high→low, so bids[0]/asks[0] are the *worst*
+        quotes, not the best.  REST is fast enough (< 200ms) for our 5-second loop.
+        """
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
