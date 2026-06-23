@@ -31,6 +31,7 @@ MIN_WIN_RATE   = 0.60   # must win at least 60% of resolved trades
 MIN_TRADES     = 20     # need enough history to be meaningful
 MIN_PROFIT     = 100    # must have made at least $100 total
 MAX_TRADES_CAP = 200    # confidence saturates after this many trades
+MAX_BOTH_SIDES_PCT = 0.25   # reject if >25% of positions are two-sided (market making, not conviction)
 
 
 @dataclass
@@ -51,6 +52,7 @@ class TraderProfile:
     reject_reason:  str         # why rejected, if applicable
     last_seen:      str         # ISO timestamp of most recent trade
     added_at:       str         # when we first added this trader
+    both_sides_pct: float = 0.0 # fraction of positions where both outcomes were bought (market-making signal)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -107,6 +109,24 @@ class TraderAnalyzer:
             cid = str(b.get("conditionId") or "")
             if cid and cid not in seen_conditions:
                 seen_conditions[cid] = b
+
+        # ── Detect two-sided / market-making behavior ─────────────────────────
+        # If a wallet buys BOTH outcomes of the same market, that's hedged
+        # liquidity provision, not a directional bet — win_rate computed from
+        # only the first-seen side is misleading for these wallets (it credits
+        # a "win" on whichever side happened to be tracked, ignoring the loss
+        # on the untracked opposite side bought in the same market).
+        condition_outcomes: dict[str, set] = {}
+        for b in buys:
+            cid = str(b.get("conditionId") or "")
+            if not cid:
+                continue
+            outcome_key = b.get("outcomeIndex")
+            if outcome_key is None:
+                outcome_key = b.get("asset")
+            condition_outcomes.setdefault(cid, set()).add(outcome_key)
+        both_sides_conditions = sum(1 for s in condition_outcomes.values() if len(s) >= 2)
+        both_sides_pct = round(both_sides_conditions / len(condition_outcomes), 3) if condition_outcomes else 0.0
 
         # ── Determine wins via REDEEMs ────────────────────────────────────────
         # A REDEEM with conditionId X means we held winning tokens for market X.
@@ -172,7 +192,13 @@ class TraderAnalyzer:
         # ── Qualification ─────────────────────────────────────────────────────
         status = "approved"
         reject_reason = ""
-        if total_trades < MIN_TRADES:
+        if both_sides_pct > MAX_BOTH_SIDES_PCT:
+            status = "rejected"
+            reject_reason = (
+                f"{both_sides_pct:.0%} of positions buy both outcomes of the same "
+                f"market — market making, not a directional edge worth copying"
+            )
+        elif total_trades < MIN_TRADES:
             status = "watching"
             reject_reason = f"only {total_trades} trades (need {MIN_TRADES})"
         elif win_rate < MIN_WIN_RATE:
@@ -199,6 +225,7 @@ class TraderAnalyzer:
             sport_breakdown=sport_breakdown,
             confidence=confidence,
             copy_weight=copy_weight,
+            both_sides_pct=both_sides_pct,
             status=status,
             reject_reason=reject_reason,
             last_seen=last_seen,

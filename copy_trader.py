@@ -30,6 +30,7 @@ MAX_ENTRY      = float(os.getenv("COPY_MAX_ENTRY", "0.92"))
 MIN_ENTRY      = float(os.getenv("COPY_MIN_ENTRY", "0.05"))
 PAPER_MODE     = os.getenv("COPY_PAPER", "true").lower() != "false"
 RESOLVE_INTERVAL = 300
+MAX_EXPOSURE_PCT = float(os.getenv("COPY_MAX_EXPOSURE_PCT", "1.0"))  # cap open exposure at this multiple of bankroll
 
 
 @dataclass
@@ -136,6 +137,20 @@ class CopyTrader:
             if shares < 1:
                 return
             actual_cost = round(price * shares, 2)
+
+            # Exposure cap — refuse new copies once open exposure would exceed
+            # MAX_EXPOSURE_PCT of bankroll. Without this, a burst of signals from
+            # high-frequency wallets (e.g. 5-minute crypto markets) can pile up
+            # dozens of positions far past available capital before any of them
+            # resolve and free up room.
+            current_exposure = sum(p.size_usd for p in self.positions)
+            max_exposure = self._bankroll * MAX_EXPOSURE_PCT
+            if current_exposure + actual_cost > max_exposure:
+                self._log(
+                    f"SKIP {signal.title[:40]}: exposure cap hit "
+                    f"(${current_exposure:.0f} open + ${actual_cost:.0f} > ${max_exposure:.0f} max)"
+                )
+                return
 
             paper = PAPER_MODE or self._client is None
             if not paper:
