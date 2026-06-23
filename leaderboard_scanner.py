@@ -26,11 +26,12 @@ from trader_analyzer import TraderAnalyzer, TraderProfile
 logger = logging.getLogger(__name__)
 
 DATA_API          = "https://data-api.polymarket.com"
-LEADERBOARD_API   = "https://data-api.polymarket.com/leaderboard"
+GLOBAL_TRADES_API = "https://data-api.polymarket.com/trades"
 
-SCAN_INTERVAL     = 3600    # scan leaderboard every 1 hour
 RESCORE_INTERVAL  = 86400   # re-score existing traders every 24 hours
-TOP_N             = 50      # analyze top 50 leaderboard traders
+DISCOVERY_POLL_INTERVAL = 30    # poll the global trades feed every 30s
+MIN_TRADES_TO_ANALYZE   = 4     # wallet must appear this many times in the observation window
+MIN_TRADE_SIZE_USD      = 5.0   # ignore dust trades when counting activity
 REGISTRY_PATH     = Path(os.getenv("REGISTRY_PATH", "/tmp/trader_registry.json"))
 
 # Seed wallets — top leaderboard traders, always analyzed on startup.
@@ -57,7 +58,8 @@ class LeaderboardScanner:
         self._registry: dict[str, TraderProfile] = {}   # address → profile
         self._scan_log: list[dict] = []
         self._running   = False
-        self._last_rescore: dict[str, float] = {}       # address → epoch
+        self._seen_window: dict[str, dict] = {}          # address → {count, username, total_usd}
+        self._seen_trade_ids: set = set()                # dedup transactionHash across polls
         self._load_registry()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -84,7 +86,12 @@ class LeaderboardScanner:
         self._running = True
         # Analyze all seed wallets on startup
         await self._seed()
-        # Periodic re-score loop (no leaderboard API available publicly)
+        await asyncio.gather(
+            self._discovery_loop(),
+            self._rescore_loop(),
+        )
+
+    async def _rescore_loop(self):
         while self._running:
             await asyncio.sleep(RESCORE_INTERVAL)
             try:
@@ -139,98 +146,89 @@ class LeaderboardScanner:
                 except Exception as e:
                     logger.error(f"Seed analysis failed for {username}: {e}")
 
-    # ── Leaderboard scan ──────────────────────────────────────────────────────
+    # ── Discovery (replaces the dead leaderboard scan — no public leaderboard API) ──
+    #
+    # Polymarket exposes no public "top traders" endpoint, so instead we mine the
+    # GLOBAL trades feed (every trade on the platform, not filtered by wallet) for
+    # wallets that show up repeatedly. A wallet seen >= MIN_TRADES_TO_ANALYZE times
+    # in the rolling observation window is "active enough to be worth analyzing" —
+    # then it goes through the same TraderAnalyzer qualification as seed wallets.
+    # This means the registry self-refreshes with currently-active traders instead
+    # of going stale on a fixed hardcoded list.
 
-    async def _scan(self):
-        self._log("Scanning leaderboard…")
-        top_traders = await self._fetch_leaderboard()
-        if not top_traders:
-            self._log("Leaderboard fetch returned no data")
-            return
-
-        new_count = 0
-        for trader in top_traders[:TOP_N]:
-            address  = (trader.get("address") or trader.get("user") or "").lower()
-            username = trader.get("name") or trader.get("username") or address[:10] + "…"
-            if not address:
-                continue
-            if address in self._registry:
-                # Maybe re-score if stale
-                await self._maybe_rescore(address)
-                continue
-            # New wallet — analyze it
+    async def _discovery_loop(self):
+        from trader_analyzer import _detect_sport
+        while self._running:
             try:
-                await asyncio.sleep(0.5)   # rate limit
+                await self._poll_global_trades(_detect_sport)
+            except Exception as e:
+                logger.error(f"Discovery poll error: {e}")
+            await asyncio.sleep(DISCOVERY_POLL_INTERVAL)
+
+    async def _poll_global_trades(self, detect_sport):
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(GLOBAL_TRADES_API, params={"limit": "200"}) as resp:
+                if resp.status != 200:
+                    return
+                trades = await resp.json()
+
+        new_observations = 0
+        for t in trades:
+            txn = t.get("transactionHash", "")
+            if not txn or txn in self._seen_trade_ids:
+                continue
+            self._seen_trade_ids.add(txn)
+
+            usdc = float(t.get("size", 0)) * float(t.get("price", 0))
+            if usdc < MIN_TRADE_SIZE_USD:
+                continue
+
+            address = (t.get("proxyWallet") or "").lower()
+            if not address or address in self._registry:
+                continue
+
+            sport = detect_sport(t.get("title", ""))
+            entry = self._seen_window.setdefault(address, {
+                "count": 0, "username": t.get("name") or t.get("pseudonym") or address[:10] + "…",
+                "sports_seen": set(),
+            })
+            entry["count"] += 1
+            entry["sports_seen"].add(sport)
+            new_observations += 1
+
+        # Trim _seen_trade_ids so it doesn't grow forever
+        if len(self._seen_trade_ids) > 20000:
+            self._seen_trade_ids = set(list(self._seen_trade_ids)[-10000:])
+
+        # Promote any candidate that's crossed the activity threshold
+        candidates = [addr for addr, e in self._seen_window.items()
+                      if e["count"] >= MIN_TRADES_TO_ANALYZE]
+        if candidates:
+            await self._promote_candidates(candidates)
+
+    async def _promote_candidates(self, addresses: list[str]):
+        promoted = 0
+        for address in addresses:
+            entry = self._seen_window.pop(address, None)
+            if not entry or address in self._registry:
+                continue
+            username = entry["username"]
+            try:
+                await asyncio.sleep(0.5)   # rate limit vs data-api
                 profile = await self._analyzer.analyze(address, username)
                 self._registry[address] = profile
-                new_count += 1
+                promoted += 1
                 self._log(
                     f"{'✓ APPROVED' if profile.status=='approved' else '~ watching' if profile.status=='watching' else '✗ rejected'}"
-                    f" {username}: {profile.win_rate:.1%} WR, "
+                    f" [discovered] {username}: {profile.win_rate:.1%} WR, "
                     f"{profile.total_trades} trades, {profile.sport_focus}"
                     + (f" — {profile.reject_reason}" if profile.reject_reason else "")
                 )
             except Exception as e:
-                logger.error(f"Analysis failed for {address[:10]}: {e}")
-
-        self._save_registry()
-        approved = len(self.approved_wallets)
-        self._log(f"Scan complete: {new_count} new wallets, {approved} approved total")
-
-    async def _maybe_rescore(self, address: str):
-        import time
-        last = self._last_rescore.get(address, 0)
-        if time.time() - last < RESCORE_INTERVAL:
-            return
-        self._last_rescore[address] = __import__("time").time()
-        existing = self._registry[address]
-        try:
-            profile = await self._analyzer.analyze(address, existing.username)
-            # Check for degradation
-            if (existing.status == "approved"
-                    and profile.win_rate < existing.win_rate - 0.10):
-                profile.status = "paused"
-                profile.reject_reason = (
-                    f"win rate dropped from {existing.win_rate:.1%} "
-                    f"to {profile.win_rate:.1%}"
-                )
-                self._log(f"⚠ PAUSED {existing.username}: {profile.reject_reason}")
-            elif existing.status == "paused" and profile.win_rate >= 0.60:
-                profile.status = "approved"
-                self._log(f"↑ REINSTATED {existing.username}: {profile.win_rate:.1%} WR")
-            self._registry[address] = profile
+                logger.error(f"Discovery analysis failed for {address[:10]}: {e}")
+        if promoted:
             self._save_registry()
-        except Exception as e:
-            logger.error(f"Rescore failed for {address[:10]}: {e}")
-
-    # ── Leaderboard fetch ─────────────────────────────────────────────────────
-
-    async def _fetch_leaderboard(self) -> list[dict]:
-        """
-        Try multiple known leaderboard endpoints.
-        Polymarket exposes leaderboard data at several paths.
-        """
-        endpoints = [
-            f"{DATA_API}/leaderboard",
-            f"{DATA_API}/leaderboard?interval=monthly&limit={TOP_N}",
-            f"{DATA_API}/profiles?sortBy=profit&limit={TOP_N}",
-        ]
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            for url in endpoints:
-                try:
-                    async with session.get(url) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                        if isinstance(data, list) and data:
-                            return data
-                        if isinstance(data, dict):
-                            for key in ("data", "traders", "leaderboard", "users"):
-                                if key in data and isinstance(data[key], list):
-                                    return data[key]
-                except Exception as e:
-                    logger.debug(f"Leaderboard endpoint {url} failed: {e}")
-        return []
+            self._log(f"Discovery: {promoted} new wallets analyzed, {len(self.approved_wallets)} approved total")
 
     # ── Registry persistence ──────────────────────────────────────────────────
 
