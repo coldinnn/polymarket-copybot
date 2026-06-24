@@ -21,7 +21,6 @@ from monitor import WalletMonitor, CopySignal
 logger = logging.getLogger(__name__)
 
 CLOB_HOST      = "https://clob.polymarket.com"
-DATA_API       = "https://data-api.polymarket.com"
 CHAIN_ID       = 137
 
 COPY_SIZE_USD  = float(os.getenv("COPY_SIZE_USD",  "25"))
@@ -214,41 +213,23 @@ class CopyTrader:
                 logger.error(f"Resolve loop error: {e}")
 
     async def _check_resolved(self):
+        """
+        Checks each open position directly against the CLOB market record —
+        not by waiting for the source wallet to redeem. The old approach only
+        marked a position resolved once the COPIED trader redeemed a winning
+        token for that conditionId; if they lost that leg (no redeem ever
+        happens for a losing position) or simply hadn't redeemed yet, our
+        copy would sit "open" indefinitely even after the market had long
+        since closed. Checking the market's own `closed` + per-token
+        `winner` flag is reliable regardless of what the source wallet does.
+        """
         if not self.positions:
-            return
-        from monitor import DATA_API as _DATA_API
-        # Collect condition IDs that have been redeemed by any source wallet
-        source_wallets = list({p.source_wallet for p in self.positions})
-        redeemed_conditions: set[str] = set()
-
-        for wallet in source_wallets:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{_DATA_API}/activity",
-                        params={"user": wallet, "limit": "100"},
-                    ) as resp:
-                        if resp.status != 200:
-                            continue
-                        data = await resp.json()
-                        for item in (data if isinstance(data, list) else []):
-                            if (item.get("type") or "").upper() == "REDEEM":
-                                cid = str(item.get("conditionId") or "")
-                                if cid:
-                                    redeemed_conditions.add(cid)
-            except Exception as e:
-                logger.error(f"Resolve fetch error for {wallet[:10]}: {e}")
-
-        if not redeemed_conditions:
             return
 
         async with self._lock:
             still_open = []
             for pos in self.positions:
-                if pos.condition_id not in redeemed_conditions:
-                    still_open.append(pos)
-                    continue
-                won = await self._is_redeemable(pos.token_id)
+                won = await self._check_market_outcome(pos.condition_id, pos.token_id)
                 if won is None:
                     still_open.append(pos)
                     continue
@@ -266,29 +247,29 @@ class CopyTrader:
                 self.history.append(pos)
             self.positions = still_open
 
-    async def _is_redeemable(self, token_id: str) -> Optional[bool]:
-        wallet = os.getenv("POLY_WALLET", "")
-        if not wallet and self._client:
-            try:
-                wallet = self._client._signer.address
-            except Exception:
-                pass
-        if not wallet:
+    async def _check_market_outcome(self, condition_id: str, token_id: str) -> Optional[bool]:
+        """
+        None  -> market not resolved yet (still open)
+        True  -> our token won
+        False -> our token lost
+        """
+        if not condition_id:
             return None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    f"{DATA_API}/positions",
-                    params={"user": wallet, "limit": "500"},
+                    f"{CLOB_HOST}/markets/{condition_id}",
+                    timeout=aiohttp.ClientTimeout(total=8),
                 ) as resp:
                     if resp.status != 200:
                         return None
                     data = await resp.json()
-                    for p in (data if isinstance(data, list) else []):
-                        tid = str(p.get("asset_id") or p.get("tokenId") or "")
-                        if tid == token_id:
-                            return bool(p.get("redeemable"))
-                    return False
+                    if not data.get("closed"):
+                        return None
+                    for t in data.get("tokens", []):
+                        if str(t.get("token_id") or "") == token_id:
+                            return bool(t.get("winner"))
+                    return None
         except Exception:
             return None
 
